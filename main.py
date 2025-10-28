@@ -328,10 +328,14 @@ class BitTorrentClient:
             time.sleep(0.5)  # Reduced sleep for faster updates
             
             # Auto-stop at 10% for demo (remove this in real use)
-            if progress['percent'] >= 10.0:
-                print(f"\n\n🎉 Demo complete - Reached 10%!")
-                print("   Remove the auto-stop to download fully")
-                break
+            # if progress['percent'] >= 10.0:
+            #     print(f"\n\n🎉 Demo complete - Reached 10%!")
+            #     print("   Remove the auto-stop to download fully")
+            #     break
+            
+            # Remove the 10% demo stopper - now downloads fully
+            # (This was previously stopping at 10% for demo purposes)
+            # Download will now continue to 100%
         
         if self.pieces_manager.all_pieces_completed():
             self._show_completion_clean()
