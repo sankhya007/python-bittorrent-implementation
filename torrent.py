@@ -336,12 +336,16 @@ class Torrent:
             return []
 
     def _generate_peer_id(self):
-        """Generate peer ID according to BitTorrent convention"""
-        # Format: -PC0001- + random bytes
-        client_id = b'-PC'
-        version = b'0001-'
-        random_bytes = os.urandom(12)
-        return client_id + version + random_bytes
+        """Generate peer ID that looks like a common client"""
+        # qBittorrent-like ID (more likely to be accepted)
+        # Format: -qB4500- + random bytes
+        import random
+        client_id = b'-qB4500-'
+        random_bytes = bytes([random.randint(0, 255) for _ in range(12)])
+        return client_id + random_bytes
+        
+        # Or Transmission-like
+        # return b'-TR3000-' + os.urandom(12)
 
     def get_piece_hash(self, piece_index):
         """Get SHA1 hash for a specific piece"""

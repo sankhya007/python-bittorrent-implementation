@@ -36,52 +36,37 @@ class PiecesManager:
         logging.info(f"PiecesManager initialized with {self.number_of_pieces} pieces")
 
     def _initialize_files(self):
-        """Create and pre-allocate files with correct sizes"""
-        logging.info("Initializing file structure...")
+        """Check existing files but don't create new ones"""
+        logging.info("Checking file structure...")
         
-        created_files = 0
+        existing_files = 0
+        missing_files = 0
+        
         for file_info in self.torrent.file_names:
             path = file_info["path"]
             length = file_info["length"]
             
-            try:
-                # Create directory if needed
-                dir_path = os.path.dirname(path)
-                if dir_path and not os.path.exists(dir_path):
-                    os.makedirs(dir_path, exist_ok=True)
-                    logging.debug(f"Created directory: {dir_path}")
-                
-                # Create file with correct size if it doesn't exist or is wrong size
-                if not os.path.exists(path) or os.path.getsize(path) != length:
-                    with open(path, 'wb') as f:
-                        # Pre-allocate file space efficiently
-                        if length > 1024 * 1024:  # For large files, use sparse allocation
-                            f.seek(length - 1)
-                            f.write(b'\x00')
-                        else:
-                            # For small files, write actual zeros
-                            f.write(b'\x00' * length)
-                    
-                    logging.debug(f"Initialized file: {path} ({length} bytes)")
-                    created_files += 1
+            if os.path.exists(path):
+                actual_size = os.path.getsize(path)
+                if actual_size == length:
+                    logging.info(f"✅ File exists with correct size: {path}")
+                    existing_files += 1
                 else:
-                    logging.debug(f"File already exists with correct size: {path}")
-                    
-            except Exception as e:
-                logging.error(f"Failed to initialize file {path}: {e}")
-                # Continue with other files rather than failing completely
+                    logging.warning(f"⚠️ File exists with wrong size: {path} ({actual_size} vs {length})")
+                    # Optionally remove the wrong-sized file
+                    # os.remove(path)
+            else:
+                logging.info(f"📁 File will be created during download: {path}")
+                missing_files += 1
+                # DON'T create the file here - let it be created during actual download
         
-        logging.info(f"Initialized {created_files} files")
-
-    def update_bitfield(self, piece_index: int):
-        """Update bitfield when piece is completed"""
-        if 0 <= piece_index < len(self.bitfield):
-            self.bitfield[piece_index] = 1
-            logging.debug(f"Updated bitfield: piece {piece_index} completed")
+        logging.info(f"File check complete: {existing_files} existing, {missing_files} will be created during download")
 
     def receive_block_piece(self, piece_data):
-        """Receive a block and update piece with peer scoring"""
+        """Receive a block and update piece with validation"""
         piece_index, block_offset, block_data = piece_data
+        
+        print(f"🔍 RECEIVED BLOCK: piece={piece_index}, offset={block_offset}, size={len(block_data)}")  # DEBUG
         
         # Validate inputs
         if (piece_index >= len(self.pieces) or 
@@ -93,15 +78,18 @@ class PiecesManager:
         piece_obj = self.pieces[piece_index]
         
         if piece_obj.is_full:
+            print(f"🚨 WARNING: Piece {piece_index} already marked as complete!")  # DEBUG
             logging.debug(f"Piece {piece_index} already complete, ignoring block")
             return
 
         # Update the block
         piece_obj.set_block(block_offset, block_data)
         self.total_downloaded += len(block_data)
+        print(f"🔍 Set block in piece {piece_index}")  # DEBUG
 
         # Check if piece is complete
         if piece_obj.are_all_blocks_full():
+            print(f"🔍 Piece {piece_index} all blocks full, verifying...")  # DEBUG
             if piece_obj.set_to_full():
                 self.complete_pieces += 1
                 self.update_bitfield(piece_index)
@@ -111,9 +99,16 @@ class PiecesManager:
                 if hasattr(self, 'rarest_pieces'):
                     self.rarest_pieces.remove_completed_piece(piece_index)
                 
+                print(f"🎉 Piece {piece_index} VERIFIED AND COMPLETED!")  # DEBUG
                 logging.info(f"🎉 Piece {piece_index} completed! "
                            f"Progress: {self.complete_pieces}/{self.number_of_pieces} "
                            f"({self.get_completion_percentage():.1f}%)")
+
+    def update_bitfield(self, piece_index: int):
+        """Update bitfield when piece is completed"""
+        if 0 <= piece_index < len(self.bitfield):
+            self.bitfield[piece_index] = 1
+            logging.debug(f"Updated bitfield: piece {piece_index} completed")
 
     def get_block(self, piece_index: int, block_offset: int, block_length: int) -> bytes:
         """Get block data from completed piece"""
@@ -261,6 +256,13 @@ class PiecesManager:
                 if dir_path and not os.path.exists(dir_path):
                     os.makedirs(dir_path, exist_ok=True)
                 
+                # Check if file exists, if not create it
+                if not os.path.exists(path):
+                    with open(path, 'wb') as f:
+                        # Create empty file with correct size
+                        f.seek(file_offset + length - 1)
+                        f.write(b'\x00')
+                
                 # Write to file
                 with open(path, 'r+b') as f:
                     f.seek(file_offset)
@@ -269,23 +271,6 @@ class PiecesManager:
                     
                 successful_writes += 1
                 logging.debug(f"Written {length} bytes to {path} at offset {file_offset}")
-                    
-            except FileNotFoundError:
-                # File doesn't exist yet - create it
-                try:
-                    with open(path, 'wb') as f:
-                        # Ensure file is correct size
-                        if file_offset + length > os.path.getsize(path) if os.path.exists(path) else 0:
-                            f.truncate(file_offset + length)
-                        f.seek(file_offset)
-                        data_to_write = piece_obj.raw_data[piece_offset:piece_offset + length]
-                        f.write(data_to_write)
-                        
-                    successful_writes += 1
-                    logging.debug(f"Created and written {length} bytes to {path}")
-                    
-                except Exception as e:
-                    logging.error(f"Failed to create and write file {path}: {e}")
                     
             except Exception as e:
                 logging.error(f"Failed to write to file {path}: {e}")
@@ -314,8 +299,3 @@ class PiecesManager:
             stats['eta_seconds'] = remaining_bytes / (stats['download_speed_kbps'] * 1024)
             
         return stats
-
-    # REMOVE these methods - they don't belong here and duplicate peers_manager functionality
-    # def unchoked_peers_count(self):
-    # def log_peer_states(self): 
-    # def _process_new_message(self, new_message, peer_obj):
