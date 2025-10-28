@@ -3,7 +3,6 @@ import socket
 import struct
 import bitstring
 import logging
-import asyncio
 
 
 class WrongMessageException(Exception):
@@ -15,8 +14,28 @@ class MessageDispatcher:
         self.payload = payload
 
     def dispatch(self):
+        if len(self.payload) < 4:
+            logging.warning(f"Message too short: {len(self.payload)} bytes")
+            return None
+
         try:
-            payload_length, message_id = struct.unpack(">IB", self.payload[:5])
+            payload_length = struct.unpack(">I", self.payload[:4])[0]
+            
+            # Validate payload length
+            if payload_length > 10 * 1024 * 1024:  # 10MB max
+                logging.error(f"Payload too large: {payload_length} bytes")
+                return None
+                
+            if payload_length == 0:
+                # Keep-alive message
+                return KeepAlive.from_bytes(self.payload)
+                
+            if len(self.payload) < 5:  # Need at least 4 + 1 bytes for message ID
+                logging.warning(f"Incomplete message: {len(self.payload)} bytes")
+                return None
+                
+            message_id = struct.unpack(">B", self.payload[4:5])[0]
+
         except Exception as e:
             logging.warning(f"Error when unpacking message: {e}")
             return None
@@ -35,9 +54,14 @@ class MessageDispatcher:
         }
 
         if message_id not in map_id_to_message:
-            raise WrongMessageException("Wrong message id")
+            logging.warning(f"Unknown message id: {message_id}")
+            raise WrongMessageException(f"Wrong message id: {message_id}")
 
-        return map_id_to_message[message_id].from_bytes(self.payload)
+        try:
+            return map_id_to_message[message_id].from_bytes(self.payload)
+        except Exception as e:
+            logging.error(f"Failed to parse message type {message_id}: {e}")
+            return None
 
 
 class Message:
@@ -55,13 +79,16 @@ HANDSHAKE_PSTR_LEN = len(HANDSHAKE_PSTR_V1)
 
 
 class Handshake(Message):
-    payload_length = 68
-    total_length = payload_length
-
     def __init__(self, info_hash, peer_id=b'-PC0001-000000000000'):
         super().__init__()
+        if len(info_hash) != 20:
+            raise ValueError(f"Info hash must be 20 bytes, got {len(info_hash)}")
+        if len(peer_id) != 20:
+            raise ValueError(f"Peer ID must be 20 bytes, got {len(peer_id)}")
+            
         self.info_hash = info_hash
         self.peer_id = peer_id
+        self.total_length = 1 + HANDSHAKE_PSTR_LEN + 8 + 20 + 20
 
     def to_bytes(self):
         reserved = b'\x00' * 8
@@ -74,22 +101,37 @@ class Handshake(Message):
 
     @classmethod
     def from_bytes(cls, payload):
+        if len(payload) < 1:
+            raise WrongMessageException("Handshake too short")
+            
         pstrlen, = struct.unpack(">B", payload[:1])
+        
+        if pstrlen != HANDSHAKE_PSTR_LEN:
+            raise WrongMessageException(f"Invalid protocol string length: {pstrlen}")
+            
+        expected_length = 1 + pstrlen + 8 + 20 + 20
+        if len(payload) < expected_length:
+            raise WrongMessageException(f"Handshake incomplete: {len(payload)} < {expected_length}")
+            
         pstr, reserved, info_hash, peer_id = struct.unpack(
-            f">{pstrlen}s8s20s20s", payload[1:cls.total_length])
+            f">{pstrlen}s8s20s20s", payload[1:expected_length])
+            
+        if pstr != HANDSHAKE_PSTR_V1:
+            raise WrongMessageException(f"Invalid protocol string: {pstr}")
+            
         return Handshake(info_hash, peer_id)
 
 
 class KeepAlive(Message):
-    payload_length = 0
-    total_length = 4
-
     def to_bytes(self):
-        return struct.pack(">I", self.payload_length)
+        return struct.pack(">I", 0)
 
     @classmethod
     def from_bytes(cls, payload):
-        payload_length = struct.unpack(">I", payload[:cls.total_length])[0]
+        if len(payload) < 4:
+            raise WrongMessageException("Keep-alive message too short")
+            
+        payload_length = struct.unpack(">I", payload[:4])[0]
         if payload_length != 0:
             raise WrongMessageException("Not a Keep Alive message")
         return KeepAlive()
@@ -97,15 +139,18 @@ class KeepAlive(Message):
 
 class Choke(Message):
     message_id = 0
-    payload_length = 1
-    total_length = 5
 
     def to_bytes(self):
-        return struct.pack(">IB", self.payload_length, self.message_id)
+        return struct.pack(">IB", 1, self.message_id)
 
     @classmethod
     def from_bytes(cls, payload):
-        payload_length, message_id = struct.unpack(">IB", payload[:cls.total_length])
+        if len(payload) < 5:
+            raise WrongMessageException("Choke message too short")
+            
+        payload_length, message_id = struct.unpack(">IB", payload[:5])
+        if payload_length != 1:
+            raise WrongMessageException(f"Invalid choke payload length: {payload_length}")
         if message_id != cls.message_id:
             raise WrongMessageException("Not a Choke message")
         return Choke()
@@ -113,15 +158,18 @@ class Choke(Message):
 
 class UnChoke(Message):
     message_id = 1
-    payload_length = 1
-    total_length = 5
 
     def to_bytes(self):
-        return struct.pack(">IB", self.payload_length, self.message_id)
+        return struct.pack(">IB", 1, self.message_id)
 
     @classmethod
     def from_bytes(cls, payload):
-        payload_length, message_id = struct.unpack(">IB", payload[:cls.total_length])
+        if len(payload) < 5:
+            raise WrongMessageException("UnChoke message too short")
+            
+        payload_length, message_id = struct.unpack(">IB", payload[:5])
+        if payload_length != 1:
+            raise WrongMessageException(f"Invalid unchoke payload length: {payload_length}")
         if message_id != cls.message_id:
             raise WrongMessageException("Not an UnChoke message")
         return UnChoke()
@@ -129,15 +177,18 @@ class UnChoke(Message):
 
 class Interested(Message):
     message_id = 2
-    payload_length = 1
-    total_length = 5
 
     def to_bytes(self):
-        return struct.pack(">IB", self.payload_length, self.message_id)
+        return struct.pack(">IB", 1, self.message_id)
 
     @classmethod
     def from_bytes(cls, payload):
-        payload_length, message_id = struct.unpack(">IB", payload[:cls.total_length])
+        if len(payload) < 5:
+            raise WrongMessageException("Interested message too short")
+            
+        payload_length, message_id = struct.unpack(">IB", payload[:5])
+        if payload_length != 1:
+            raise WrongMessageException(f"Invalid interested payload length: {payload_length}")
         if message_id != cls.message_id:
             raise WrongMessageException("Not an Interested message")
         return Interested()
@@ -145,15 +196,18 @@ class Interested(Message):
 
 class NotInterested(Message):
     message_id = 3
-    payload_length = 1
-    total_length = 5
 
     def to_bytes(self):
-        return struct.pack(">IB", self.payload_length, self.message_id)
+        return struct.pack(">IB", 1, self.message_id)
 
     @classmethod
     def from_bytes(cls, payload):
-        payload_length, message_id = struct.unpack(">IB", payload[:cls.total_length])
+        if len(payload) < 5:
+            raise WrongMessageException("NotInterested message too short")
+            
+        payload_length, message_id = struct.unpack(">IB", payload[:5])
+        if payload_length != 1:
+            raise WrongMessageException(f"Invalid not-interested payload length: {payload_length}")
         if message_id != cls.message_id:
             raise WrongMessageException("Not a NotInterested message")
         return NotInterested()
@@ -161,21 +215,28 @@ class NotInterested(Message):
 
 class Have(Message):
     message_id = 4
-    payload_length = 5
-    total_length = 9
 
     def __init__(self, piece_index):
         super().__init__()
+        if piece_index < 0:
+            raise ValueError(f"Invalid piece index: {piece_index}")
         self.piece_index = piece_index
 
     def to_bytes(self):
-        return struct.pack(">IBI", self.payload_length, self.message_id, self.piece_index)
+        return struct.pack(">IBI", 5, self.message_id, self.piece_index)
 
     @classmethod
     def from_bytes(cls, payload):
-        payload_length, message_id, piece_index = struct.unpack(">IBI", payload[:cls.total_length])
+        if len(payload) < 9:
+            raise WrongMessageException("Have message too short")
+            
+        payload_length, message_id, piece_index = struct.unpack(">IBI", payload[:9])
+        if payload_length != 5:
+            raise WrongMessageException(f"Invalid have payload length: {payload_length}")
         if message_id != cls.message_id:
             raise WrongMessageException("Not a Have message")
+        if piece_index < 0:
+            raise WrongMessageException(f"Invalid piece index in have message: {piece_index}")
         return Have(piece_index)
 
 
@@ -188,7 +249,6 @@ class BitField(Message):
         self.bitfield_as_bytes = bitfield.tobytes()
         self.bitfield_length = len(self.bitfield_as_bytes)
         self.payload_length = 1 + self.bitfield_length
-        self.total_length = 4 + self.payload_length
 
     def to_bytes(self):
         return struct.pack(f">IB{self.bitfield_length}s",
@@ -198,11 +258,21 @@ class BitField(Message):
 
     @classmethod
     def from_bytes(cls, payload):
+        if len(payload) < 5:
+            raise WrongMessageException("BitField message too short")
+            
         payload_length, message_id = struct.unpack(">IB", payload[:5])
-        bitfield_length = payload_length - 1
         
         if message_id != cls.message_id:
             raise WrongMessageException("Not a BitField message")
+            
+        bitfield_length = payload_length - 1
+        
+        if bitfield_length < 0:
+            raise WrongMessageException(f"Invalid bitfield length: {bitfield_length}")
+            
+        if len(payload) < 5 + bitfield_length:
+            raise WrongMessageException(f"BitField message incomplete: {len(payload)} < {5 + bitfield_length}")
             
         raw_bitfield = struct.unpack(f"{bitfield_length}s", payload[5:5 + bitfield_length])[0]
         bitfield = bitstring.BitArray(bytes=raw_bitfield)
@@ -211,18 +281,23 @@ class BitField(Message):
 
 class Request(Message):
     message_id = 6
-    payload_length = 13
-    total_length = 17
 
     def __init__(self, piece_index, block_offset, block_length):
         super().__init__()
+        if piece_index < 0:
+            raise ValueError(f"Invalid piece index: {piece_index}")
+        if block_offset < 0:
+            raise ValueError(f"Invalid block offset: {block_offset}")
+        if block_length <= 0 or block_length > 16384:  # 16KB max
+            raise ValueError(f"Invalid block length: {block_length}")
+            
         self.piece_index = piece_index
         self.block_offset = block_offset
         self.block_length = block_length
 
     def to_bytes(self):
         return struct.pack(">IBIII",
-                          self.payload_length,
+                          13,  # payload_length
                           self.message_id,
                           self.piece_index,
                           self.block_offset,
@@ -230,10 +305,23 @@ class Request(Message):
 
     @classmethod
     def from_bytes(cls, payload):
+        if len(payload) < 17:
+            raise WrongMessageException("Request message too short")
+            
         payload_length, message_id, piece_index, block_offset, block_length = struct.unpack(
-            ">IBIII", payload[:cls.total_length])
+            ">IBIII", payload[:17])
+            
+        if payload_length != 13:
+            raise WrongMessageException(f"Invalid request payload length: {payload_length}")
         if message_id != cls.message_id:
             raise WrongMessageException("Not a Request message")
+        if piece_index < 0:
+            raise WrongMessageException(f"Invalid piece index in request: {piece_index}")
+        if block_offset < 0:
+            raise WrongMessageException(f"Invalid block offset in request: {block_offset}")
+        if block_length <= 0 or block_length > 16384:
+            raise WrongMessageException(f"Invalid block length in request: {block_length}")
+            
         return Request(piece_index, block_offset, block_length)
 
 
@@ -242,12 +330,18 @@ class Piece(Message):
 
     def __init__(self, piece_index, block_offset, block):
         super().__init__()
+        if piece_index < 0:
+            raise ValueError(f"Invalid piece index: {piece_index}")
+        if block_offset < 0:
+            raise ValueError(f"Invalid block offset: {block_offset}")
+        if not block:
+            raise ValueError("Block data cannot be empty")
+            
         self.piece_index = piece_index
         self.block_offset = block_offset
         self.block = block
         self.block_length = len(block)
         self.payload_length = 9 + self.block_length
-        self.total_length = 4 + self.payload_length
 
     def to_bytes(self):
         return struct.pack(f">IBII{self.block_length}s",
@@ -263,10 +357,22 @@ class Piece(Message):
             raise WrongMessageException("Piece message too short")
             
         payload_length, message_id, piece_index, block_offset = struct.unpack(">IBII", payload[:13])
-        block_length = payload_length - 9
         
         if message_id != cls.message_id:
             raise WrongMessageException("Not a Piece message")
+            
+        if payload_length < 9:
+            raise WrongMessageException(f"Invalid piece payload length: {payload_length}")
+            
+        block_length = payload_length - 9
+        
+        if len(payload) < 13 + block_length:
+            raise WrongMessageException(f"Piece message incomplete: {len(payload)} < {13 + block_length}")
+            
+        if piece_index < 0:
+            raise WrongMessageException(f"Invalid piece index in piece message: {piece_index}")
+        if block_offset < 0:
+            raise WrongMessageException(f"Invalid block offset in piece message: {block_offset}")
             
         block = payload[13:13 + block_length]
         return Piece(piece_index, block_offset, block)
@@ -274,18 +380,23 @@ class Piece(Message):
 
 class Cancel(Message):
     message_id = 8
-    payload_length = 13
-    total_length = 17
 
     def __init__(self, piece_index, block_offset, block_length):
         super().__init__()
+        if piece_index < 0:
+            raise ValueError(f"Invalid piece index: {piece_index}")
+        if block_offset < 0:
+            raise ValueError(f"Invalid block offset: {block_offset}")
+        if block_length <= 0:
+            raise ValueError(f"Invalid block length: {block_length}")
+            
         self.piece_index = piece_index
         self.block_offset = block_offset
         self.block_length = block_length
 
     def to_bytes(self):
         return struct.pack(">IBIII",
-                          self.payload_length,
+                          13,  # payload_length
                           self.message_id,
                           self.piece_index,
                           self.block_offset,
@@ -293,47 +404,60 @@ class Cancel(Message):
 
     @classmethod
     def from_bytes(cls, payload):
+        if len(payload) < 17:
+            raise WrongMessageException("Cancel message too short")
+            
         payload_length, message_id, piece_index, block_offset, block_length = struct.unpack(
-            ">IBIII", payload[:cls.total_length])
+            ">IBIII", payload[:17])
+            
+        if payload_length != 13:
+            raise WrongMessageException(f"Invalid cancel payload length: {payload_length}")
         if message_id != cls.message_id:
             raise WrongMessageException("Not a Cancel message")
+        if piece_index < 0:
+            raise WrongMessageException(f"Invalid piece index in cancel: {piece_index}")
+        if block_offset < 0:
+            raise WrongMessageException(f"Invalid block offset in cancel: {block_offset}")
+        if block_length <= 0:
+            raise WrongMessageException(f"Invalid block length in cancel: {block_length}")
+            
         return Cancel(piece_index, block_offset, block_length)
     
     
 class Port(Message):
-        """
-        PORT = <length><message id><port number>
-            - length = 5 (4 bytes)
-            - message id = 9 (1 byte)
-            - port number = listen_port (4 bytes)
-        """
-        message_id = 9
-        payload_length = 5
-        total_length = 9
+    message_id = 9
 
-        def __init__(self, listen_port):
-            super().__init__()
-            self.listen_port = listen_port
+    def __init__(self, listen_port):
+        super().__init__()
+        if listen_port < 0 or listen_port > 65535:
+            raise ValueError(f"Invalid port number: {listen_port}")
+        self.listen_port = listen_port
 
-        def to_bytes(self):
-            return struct.pack(">IBI",
-                            self.payload_length,
-                            self.message_id,
-                            self.listen_port)
+    def to_bytes(self):
+        return struct.pack(">IBI",
+                        5,  # payload_length
+                        self.message_id,
+                        self.listen_port)
 
-        @classmethod
-        def from_bytes(cls, payload):
-            payload_length, message_id, listen_port = struct.unpack(">IBI", payload[:cls.total_length])
+    @classmethod
+    def from_bytes(cls, payload):
+        if len(payload) < 9:
+            raise WrongMessageException("Port message too short")
             
-            if message_id != cls.message_id:
-                raise WrongMessageException("Not a Port message")
-                
-            return Port(listen_port)
+        payload_length, message_id, listen_port = struct.unpack(">IBI", payload[:9])
         
+        if payload_length != 5:
+            raise WrongMessageException(f"Invalid port payload length: {payload_length}")
+        if message_id != cls.message_id:
+            raise WrongMessageException("Not a Port message")
+        if listen_port < 0 or listen_port > 65535:
+            raise WrongMessageException(f"Invalid port number in port message: {listen_port}")
+                
+        return Port(listen_port)
+
+
 class UdpTrackerConnection:
-    """
-    UDP tracker connection message
-    """
+    """UDP tracker connection message"""
     def __init__(self):
         self.action = 0  # 0 for connect
         self.transaction_id = random.randint(0, 0xFFFFFFFF)
@@ -348,6 +472,9 @@ class UdpTrackerConnection:
         return conn_id + action + trans_id
 
     def from_bytes(self, payload):
+        if len(payload) < 16:
+            raise ValueError("UDP connection response too short")
+            
         # Response: <action (32)><transaction_id (32)><connection_id (64)>
         self.action = struct.unpack('>I', payload[0:4])[0]
         self.transaction_id = struct.unpack('>I', payload[4:8])[0]
@@ -356,10 +483,13 @@ class UdpTrackerConnection:
 
 
 class UdpTrackerAnnounce:
-    """
-    UDP tracker announce message
-    """
+    """UDP tracker announce message"""
     def __init__(self, connection_id, info_hash, peer_id, downloaded=0, left=0, uploaded=0, event=0):
+        if len(info_hash) != 20:
+            raise ValueError(f"Info hash must be 20 bytes, got {len(info_hash)}")
+        if len(peer_id) != 20:
+            raise ValueError(f"Peer ID must be 20 bytes, got {len(peer_id)}")
+            
         self.connection_id = connection_id
         self.action = 1  # 1 for announce
         self.transaction_id = random.randint(0, 0xFFFFFFFF)
@@ -391,9 +521,7 @@ class UdpTrackerAnnounce:
 
 
 class UdpTrackerAnnounceOutput:
-    """
-    Parse UDP tracker announce response
-    """
+    """Parse UDP tracker announce response"""
     def __init__(self):
         self.action = None
         self.transaction_id = None
@@ -404,7 +532,7 @@ class UdpTrackerAnnounceOutput:
 
     def from_bytes(self, payload):
         if len(payload) < 20:
-            raise ValueError("Response too short")
+            raise ValueError("UDP announce response too short")
             
         self.action = struct.unpack('>I', payload[0:4])[0]
         self.transaction_id = struct.unpack('>I', payload[4:8])[0]
@@ -413,13 +541,21 @@ class UdpTrackerAnnounceOutput:
         self.seeders = struct.unpack('>I', payload[16:20])[0]
         
         # Parse peers (6 bytes each: 4 IP + 2 port)
+        self.peers = []
         offset = 20
         while offset + 6 <= len(payload):
             ip_bytes = payload[offset:offset+4]
             port_bytes = payload[offset+4:offset+6]
             
-            ip = socket.inet_ntoa(ip_bytes)
-            port = struct.unpack('>H', port_bytes)[0]
-            
-            self.peers.append((ip, port))
+            try:
+                ip = socket.inet_ntoa(ip_bytes)
+                port = struct.unpack('>H', port_bytes)[0]
+                
+                # Validate IP and port
+                if ip and 1 <= port <= 65535:
+                    self.peers.append((ip, port))
+                    
+            except Exception as e:
+                logging.debug(f"Invalid peer data at offset {offset}: {e}")
+                
             offset += 6

@@ -4,10 +4,9 @@ import peer
 import socket
 import requests
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from torrent import bdecode
 
-import peer
 from message import UdpTrackerConnection, UdpTrackerAnnounce, UdpTrackerAnnounceOutput
 
 
@@ -18,14 +17,12 @@ class SockAddr:
         self.allowed = allowed
 
     def __hash__(self):
-        # Return an integer hash based on ip and port
         return hash((self.ip, self.port))
 
     def __str__(self):
         return f"{self.ip}:{self.port}"
 
     def __eq__(self, other):
-        # Also implement __eq__ for proper dictionary usage
         if not isinstance(other, SockAddr):
             return False
         return self.ip == other.ip and self.port == other.port
@@ -39,86 +36,101 @@ class Tracker:
 
     def get_peers_from_trackers(self):
         """Get peers from all trackers in torrent"""
-        max_peers_try = 30
-        max_peers_connected = 8
+        max_peers_try = 50  # Increased to get more peers
+        max_peers_connected = 15  # Increased connection limit
         
-        logging.info(f"Contacting {len(self.torrent.announce_list)} trackers...")
+        print(f"📡 Contacting {len(self.torrent.announce_list)} trackers...")
         
+        successful_trackers = 0
         for tracker_url in self.torrent.announce_list:
             if len(self.dict_sock_addr) >= max_peers_try:
                 break
 
             try:
                 if tracker_url.startswith("http"):
-                    self.http_scraper(tracker_url)
+                    found_peers = self.http_scraper(tracker_url)
+                    if found_peers > 0:
+                        successful_trackers += 1
                 elif tracker_url.startswith("udp"):
-                    self.udp_scraper(tracker_url)
+                    found_peers = self.udp_scraper(tracker_url)
+                    if found_peers > 0:
+                        successful_trackers += 1
                 else:
-                    logging.warning(f"Unknown tracker scheme: {tracker_url}")
+                    print(f"⚠️  Unknown tracker scheme: {tracker_url}")
             except Exception as e:
-                logging.error(f"Tracker {tracker_url} failed: {e}")
+                print(f"❌ Tracker {tracker_url} failed: {e}")
+
+        print(f"✅ {successful_trackers}/{len(self.torrent.announce_list)} trackers responded")
+        print(f"🔍 Found {len(self.dict_sock_addr)} potential peers")
 
         # Try to connect to discovered peers
-        self.try_peer_connect(max_peers_connected)
+        connected_count = self.try_peer_connect(max_peers_connected)
         
-        logging.info(f"Connected to {len(self.connected_peers)} peers")
+        print(f"🔗 Connected to {connected_count} peers")
         return self.connected_peers
 
     def try_peer_connect(self, max_peers):
         """Try to connect to discovered peers"""
-        logging.info(f"Trying to connect to {len(self.dict_sock_addr)} discovered peers")
+        print(f"🔌 Attempting to connect to {len(self.dict_sock_addr)} discovered peers...")
         
-        for sock_addr in self.dict_sock_addr.values():
-            if len(self.connected_peers) >= max_peers:
+        connected_count = 0
+        for sock_addr in list(self.dict_sock_addr.values()):
+            if connected_count >= max_peers:
                 break
 
             new_peer = peer.Peer(int(self.torrent.number_of_pieces), sock_addr.ip, sock_addr.port)
             if new_peer.connect():
                 self.connected_peers[hash(new_peer)] = new_peer
-                logging.info(f"Connected to {len(self.connected_peers)}/{max_peers} peers: {new_peer.ip}")
+                connected_count += 1
+                print(f"✅ Connected to {connected_count}/{max_peers} peers: {new_peer.ip}")
+
+        return connected_count
 
     def http_scraper(self, tracker_url):
-        """Fixed HTTP tracker with better error handling"""
-        params = {
-            'info_hash': self.torrent.info_hash,
-            'peer_id': self.torrent.peer_id,
-            'port': 6881,
-            'uploaded': 0,
-            'downloaded': 0,
-            'left': self.torrent.total_length,
-            'compact': 1,
-            'numwant': 50,
-            'event': 'started'
-        }
-
+        """Fixed HTTP tracker with proper URL encoding"""
         try:
+            # URL encode binary data properly
+            info_hash_quoted = quote(self.torrent.info_hash)
+            
+            params = {
+                'info_hash': info_hash_quoted,
+                'peer_id': self.torrent.peer_id.decode('latin-1'),
+                'port': 6881,
+                'uploaded': 0,
+                'downloaded': 0,
+                'left': self.torrent.total_length,
+                'compact': 1,
+                'numwant': 50,
+                'event': 'started'
+            }
+
             headers = {
                 'User-Agent': 'PythonBitTorrent/1.0',
-                'Accept': '*/*'
+                'Accept': '*/*',
+                'Connection': 'close'
             }
             
-            response = requests.get(tracker_url, params=params, headers=headers, timeout=10)
+            print(f"  🌐 HTTP: Contacting {tracker_url}")
+            response = requests.get(tracker_url, params=params, headers=headers, timeout=15)
             
             if response.status_code != 200:
-                print(f"  HTTP: Tracker returned status {response.status_code}")
-                return
+                print(f"  ❌ HTTP: Tracker returned status {response.status_code}")
+                return 0
                 
             try:
                 response_data = bdecode(response.content)
             except Exception as e:
-                print(f"  HTTP: Failed to decode response: {e}")
-                # Try to parse as text for debugging
-                print(f"  HTTP: Response preview: {response.content[:100]}")
-                return
+                print(f"  ❌ HTTP: Failed to decode response: {e}")
+                return 0
 
             if b'failure reason' in response_data:
                 reason = response_data[b'failure reason'].decode('utf-8', errors='ignore')
-                print(f"  HTTP: Tracker error: {reason}")
-                return
+                print(f"  ❌ HTTP: Tracker error: {reason}")
+                return 0
                 
+            peer_count = 0
             if b'peers' in response_data:
                 peers_data = response_data[b'peers']
-                peer_count = 0
                 
                 if isinstance(peers_data, bytes):
                     # Compact format
@@ -127,56 +139,98 @@ class Tracker:
                     # Dictionary format
                     peer_count = self._parse_dict_peers(peers_data)
                     
-                print(f"  HTTP: Found {peer_count} peers")
+            # Also check for peers in interval (some trackers use different key)
+            if b'peers ip' in response_data:
+                print("  ℹ️  HTTP: Found peers in 'peers ip' field")
+                
+            print(f"  ✅ HTTP: Found {peer_count} peers")
+            return peer_count
                 
         except requests.exceptions.Timeout:
-            print(f"  HTTP: Timeout contacting {tracker_url}")
+            print(f"  ⏰ HTTP: Timeout contacting {tracker_url}")
+            return 0
         except requests.exceptions.ConnectionError:
-            print(f"  HTTP: Connection error to {tracker_url}")
+            print(f"  🔌 HTTP: Connection error to {tracker_url}")
+            return 0
         except Exception as e:
-            print(f"  HTTP: Unexpected error: {e}")
+            print(f"  ❌ HTTP: Unexpected error: {e}")
+            return 0
 
     def _parse_compact_peers(self, peers_data):
         """Parse compact peer format (6 bytes per peer)"""
+        if not peers_data:
+            return 0
+            
         offset = 0
+        peer_count = 0
         while offset + 6 <= len(peers_data):
-            ip_bytes = peers_data[offset:offset+4]
-            port_bytes = peers_data[offset+4:offset+6]
-            
-            ip = socket.inet_ntoa(ip_bytes)
-            port = struct.unpack(">H", port_bytes)[0]
-            
-            sock_addr = SockAddr(ip, port)
-            self.dict_sock_addr[hash(sock_addr)] = sock_addr
-            
-            offset += 6
+            try:
+                ip_bytes = peers_data[offset:offset+4]
+                port_bytes = peers_data[offset+4:offset+6]
+                
+                ip = socket.inet_ntoa(ip_bytes)
+                port = struct.unpack(">H", port_bytes)[0]
+                
+                # Validate IP and port
+                if ip and 1 <= port <= 65535:
+                    sock_addr = SockAddr(ip, port)
+                    if hash(sock_addr) not in self.dict_sock_addr:
+                        self.dict_sock_addr[hash(sock_addr)] = sock_addr
+                        peer_count += 1
+                
+                offset += 6
+            except Exception as e:
+                print(f"    ⚠️  Failed to parse peer at offset {offset}: {e}")
+                break
+                
+        return peer_count
 
     def _parse_dict_peers(self, peers_data):
         """Parse dictionary peer format"""
+        peer_count = 0
         for peer_info in peers_data:
-            ip = peer_info[b'ip'].decode('utf-8')
-            port = peer_info[b'port']
-            
-            sock_addr = SockAddr(ip, port)
-            self.dict_sock_addr[hash(sock_addr)] = sock_addr
+            try:
+                if b'ip' in peer_info and b'port' in peer_info:
+                    ip = peer_info[b'ip'].decode('utf-8')
+                    port = peer_info[b'port']
+                    
+                    # Validate IP and port
+                    if ip and 1 <= port <= 65535:
+                        sock_addr = SockAddr(ip, port)
+                        if hash(sock_addr) not in self.dict_sock_addr:
+                            self.dict_sock_addr[hash(sock_addr)] = sock_addr
+                            peer_count += 1
+            except Exception as e:
+                print(f"    ⚠️  Failed to parse peer dict: {e}")
+                continue
+                
+        return peer_count
 
     def udp_scraper(self, announce_url):
         """Fixed UDP tracker implementation"""
-        import socket
-        from urllib.parse import urlparse
-        
         try:
             parsed = urlparse(announce_url)
             hostname = parsed.hostname
-            port = parsed.port or 80
+            port = parsed.port or 80  # Default UDP tracker port is 80, not 6969
+            
+            if not hostname:
+                print(f"  ❌ UDP: Invalid URL: {announce_url}")
+                return 0
+            
+            print(f"  🌐 UDP: Resolving {hostname}...")
             
             # Resolve hostname
-            ip = socket.gethostbyname(hostname)
-            print(f"  UDP: Resolved {hostname} -> {ip}:{port}")
+            try:
+                ip = socket.gethostbyname(hostname)
+            except socket.gaierror as e:
+                print(f"  ❌ UDP: Could not resolve {hostname}: {e}")
+                return 0
+                
+            print(f"  🔌 UDP: Connecting to {ip}:{port}")
             
             # Create socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(8)
+            sock.settimeout(10)
             
             # Connect phase
             connect_msg = UdpTrackerConnection()
@@ -185,16 +239,23 @@ class Tracker:
             try:
                 response = sock.recv(4096)
             except socket.timeout:
-                print(f"  UDP: Timeout connecting to {hostname}")
-                return
+                print(f"  ⏰ UDP: Timeout connecting to {hostname}")
+                sock.close()
+                return 0
             
             if len(response) < 16:
-                print(f"  UDP: Invalid connect response from {hostname}")
-                return
+                print(f"  ❌ UDP: Invalid connect response from {hostname}")
+                sock.close()
+                return 0
                 
             # Parse connect response
-            connect_output = UdpTrackerConnection()
-            connect_output.from_bytes(response)
+            try:
+                connect_output = UdpTrackerConnection()
+                connect_output.from_bytes(response)
+            except Exception as e:
+                print(f"  ❌ UDP: Failed to parse connect response: {e}")
+                sock.close()
+                return 0
             
             # Announce phase
             announce_msg = UdpTrackerAnnounce(
@@ -209,38 +270,46 @@ class Tracker:
             try:
                 response = sock.recv(4096)
             except socket.timeout:
-                print(f"  UDP: Timeout announcing to {hostname}")
-                return
+                print(f"  ⏰ UDP: Timeout announcing to {hostname}")
+                sock.close()
+                return 0
                 
             # Parse announce response
-            announce_output = UdpTrackerAnnounceOutput()
-            announce_output.from_bytes(response)
+            try:
+                announce_output = UdpTrackerAnnounceOutput()
+                announce_output.from_bytes(response)
+            except Exception as e:
+                print(f"  ❌ UDP: Failed to parse announce response: {e}")
+                sock.close()
+                return 0
             
             # Add discovered peers
+            peer_count = 0
             for peer_ip, peer_port in announce_output.peers:
-                sock_addr = SockAddr(peer_ip, peer_port)
-                if hash(sock_addr) not in self.dict_sock_addr:
-                    self.dict_sock_addr[hash(sock_addr)] = sock_addr
+                try:
+                    # Validate peer data
+                    if peer_ip and 1 <= peer_port <= 65535:
+                        sock_addr = SockAddr(peer_ip, peer_port)
+                        if hash(sock_addr) not in self.dict_sock_addr:
+                            self.dict_sock_addr[hash(sock_addr)] = sock_addr
+                            peer_count += 1
+                except Exception as e:
+                    print(f"    ⚠️  Invalid peer data: {e}")
+                    continue
             
-            print(f"  UDP: {hostname} returned {len(announce_output.peers)} peers")
+            print(f"  ✅ UDP: {hostname} returned {peer_count} peers")
+            sock.close()
+            return peer_count
             
         except socket.gaierror as e:
-            print(f"  UDP: Could not resolve {hostname}: {e}")
+            print(f"  ❌ UDP: Could not resolve {hostname}: {e}")
+            return 0
         except Exception as e:
-            print(f"  UDP: Error with {announce_url}: {e}")
+            print(f"  ❌ UDP: Error with {announce_url}: {e}")
+            return 0
         finally:
             if 'sock' in locals():
-                sock.close()
-
-    def _send_udp_message(self, address, sock, message):
-        """Send UDP message and wait for response"""
-        try:
-            sock.sendto(message.to_bytes(), address)
-            response, _ = sock.recvfrom(2048)
-            return response
-        except socket.timeout:
-            logging.debug("UDP tracker timeout")
-            return None
-        except Exception as e:
-            logging.error(f"UDP send error: {e}")
-            return None
+                try:
+                    sock.close()
+                except:
+                    pass
