@@ -25,7 +25,14 @@ class Peer:
         }
 
     def __hash__(self):
-        return f"{self.ip}:{self.port}"
+        # FIXED: Return integer, not string
+        return hash((self.ip, self.port))
+
+    def __eq__(self, other):
+        # Added for proper dictionary usage
+        if not isinstance(other, Peer):
+            return False
+        return self.ip == other.ip and self.port == other.port
 
     def __str__(self):
         return f"Peer({self.ip}:{self.port})"

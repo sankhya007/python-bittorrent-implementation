@@ -2,9 +2,30 @@ import piece
 import bitstring
 import logging
 import os
+import message 
 
 
 class PiecesManager:
+    
+    def _process_new_message(self, new_message, peer_obj):
+        """Process incoming message from peer with debug info"""
+        message_type = type(new_message).__name__
+        logging.debug(f"Received {message_type} from {peer_obj.ip}")
+        
+        if isinstance(new_message, message.Choke):
+            peer_obj.handle_choke()
+            logging.info(f"Peer {peer_obj.ip} CHOKED us")
+            
+        elif isinstance(new_message, message.UnChoke):
+            peer_obj.handle_unchoke()
+            logging.info(f"🎉 Peer {peer_obj.ip} UNCHOKED us! Ready to download!")
+            
+        elif isinstance(new_message, message.Interested):
+            peer_obj.handle_interested()
+            logging.info(f"Peer {peer_obj.ip} is interested in our pieces")
+            
+        # ... rest of your message handling ...
+    
     def __init__(self, torrent):
         self.torrent = torrent
         self.number_of_pieces = int(torrent.number_of_pieces)

@@ -330,94 +330,96 @@ class Port(Message):
                 
             return Port(listen_port)
         
-class UdpTrackerConnection(Message):
-        """
-        connect = <connection_id><action><transaction_id>
-            - connection_id = 64-bit integer
-            - action = 32-bit integer  
-            - transaction_id = 32-bit integer
-        """
-        def __init__(self):
-            super().__init__()
-            self.conn_id = struct.pack('>Q', 0x41727101980)  # Magic constant
-            self.action = struct.pack('>I', 0)  # Action 0 for connect
-            self.trans_id = struct.pack('>I', random.randint(0, 100000))
+class UdpTrackerConnection:
+    """
+    UDP tracker connection message
+    """
+    def __init__(self):
+        self.action = 0  # 0 for connect
+        self.transaction_id = random.randint(0, 0xFFFFFFFF)
+        self.connection_id = None
 
-        def to_bytes(self):
-            return self.conn_id + self.action + self.trans_id
+    def to_bytes(self):
+        # Protocol: <connection_id (64)><action (32)><transaction_id (32)>
+        # For initial connect, connection_id is the magic constant
+        conn_id = struct.pack('>Q', 0x41727101980)  # Magic constant
+        action = struct.pack('>I', self.action)
+        trans_id = struct.pack('>I', self.transaction_id)
+        return conn_id + action + trans_id
 
-        @classmethod
-        def from_bytes(cls, payload):
-            instance = cls()
-            instance.action = struct.unpack('>I', payload[:4])[0]
-            instance.trans_id = struct.unpack('>I', payload[4:8])[0]
-            instance.conn_id = struct.unpack('>Q', payload[8:16])[0]
-            return instance
+    def from_bytes(self, payload):
+        # Response: <action (32)><transaction_id (32)><connection_id (64)>
+        self.action = struct.unpack('>I', payload[0:4])[0]
+        self.transaction_id = struct.unpack('>I', payload[4:8])[0]
+        self.connection_id = struct.unpack('>Q', payload[8:16])[0]
+        return self
 
 
-class UdpTrackerAnnounce(Message):
-        """
-        Announce message for UDP tracker
-        """
-        def __init__(self, info_hash, conn_id, peer_id):
-            super().__init__()
-            self.info_hash = info_hash
-            self.conn_id = conn_id
-            self.peer_id = peer_id
-            self.trans_id = struct.pack('>I', random.randint(0, 100000))
-            self.action = struct.pack('>I', 1)  # Action 1 for announce
+class UdpTrackerAnnounce:
+    """
+    UDP tracker announce message
+    """
+    def __init__(self, connection_id, info_hash, peer_id, downloaded=0, left=0, uploaded=0, event=0):
+        self.connection_id = connection_id
+        self.action = 1  # 1 for announce
+        self.transaction_id = random.randint(0, 0xFFFFFFFF)
+        self.info_hash = info_hash
+        self.peer_id = peer_id
+        self.downloaded = downloaded
+        self.left = left
+        self.uploaded = uploaded
+        self.event = event  # 0: none, 1: completed, 2: started, 3: stopped
 
-        def to_bytes(self):
-            conn_id = struct.pack('>Q', self.conn_id)
-            action = self.action
-            trans_id = self.trans_id
-            downloaded = struct.pack('>Q', 0)
-            left = struct.pack('>Q', self.torrent.total_length)  # You'll need to pass torrent to this class
-            uploaded = struct.pack('>Q', 0)
-            event = struct.pack('>I', 0)  # 0: none, 1: completed, 2: started, 3: stopped
-            ip = struct.pack('>I', 0)
-            key = struct.pack('>I', 0)
-            num_want = struct.pack('>i', -1)  # -1 for default
-            port = struct.pack('>h', 6881)
-
-            msg = (conn_id + action + trans_id + self.info_hash + self.peer_id + 
-                downloaded + left + uploaded + event + ip + key + num_want + port)
-            return msg
-
-        @classmethod
-        def from_bytes(cls, payload):
-            # UDP announce responses are handled by UdpTrackerAnnounceOutput
-            pass
+    def to_bytes(self):
+        # Protocol: <connection_id (64)><action (32)><transaction_id (32)><info_hash (20)>
+        #           <peer_id (20)><downloaded (64)><left (64)><uploaded (64)><event (32)>
+        #           <ip (32)><key (32)><num_want (32)><port (16)>
+        msg = struct.pack('>Q', self.connection_id)
+        msg += struct.pack('>I', self.action)
+        msg += struct.pack('>I', self.transaction_id)
+        msg += self.info_hash
+        msg += self.peer_id
+        msg += struct.pack('>Q', self.downloaded)
+        msg += struct.pack('>Q', self.left)
+        msg += struct.pack('>Q', self.uploaded)
+        msg += struct.pack('>I', self.event)
+        msg += struct.pack('>I', 0)  # IP address (0 = default)
+        msg += struct.pack('>I', 0)  # Key
+        msg += struct.pack('>i', -1)  # num_want (-1 = default)
+        msg += struct.pack('>H', 6881)  # Port
+        return msg
 
 
 class UdpTrackerAnnounceOutput:
-        """
-        Parse UDP tracker announce response
-        """
-        def __init__(self):
-            self.action = None
-            self.transaction_id = None
-            self.interval = None
-            self.leechers = None
-            self.seeders = None
-            self.list_sock_addr = []
+    """
+    Parse UDP tracker announce response
+    """
+    def __init__(self):
+        self.action = None
+        self.transaction_id = None
+        self.interval = None
+        self.leechers = None
+        self.seeders = None
+        self.peers = []
 
-        def from_bytes(self, payload):
-            self.action = struct.unpack('>I', payload[:4])[0]
-            self.transaction_id = struct.unpack('>I', payload[4:8])[0]
-            self.interval = struct.unpack('>I', payload[8:12])[0]
-            self.leechers = struct.unpack('>I', payload[12:16])[0]
-            self.seeders = struct.unpack('>I', payload[16:20])[0]
+    def from_bytes(self, payload):
+        if len(payload) < 20:
+            raise ValueError("Response too short")
             
-            # Parse peer list (6 bytes per peer: 4 for IP, 2 for port)
-            self.list_sock_addr = []
-            offset = 20
-            while offset + 6 <= len(payload):
-                ip_bytes = payload[offset:offset+4]
-                port_bytes = payload[offset+4:offset+6]
-                
-                ip = socket.inet_ntoa(ip_bytes)
-                port = struct.unpack('>H', port_bytes)[0]
-                
-                self.list_sock_addr.append((ip, port))
-                offset += 6
+        self.action = struct.unpack('>I', payload[0:4])[0]
+        self.transaction_id = struct.unpack('>I', payload[4:8])[0]
+        self.interval = struct.unpack('>I', payload[8:12])[0]
+        self.leechers = struct.unpack('>I', payload[12:16])[0]
+        self.seeders = struct.unpack('>I', payload[16:20])[0]
+        
+        # Parse peers (6 bytes each: 4 IP + 2 port)
+        offset = 20
+        while offset + 6 <= len(payload):
+            ip_bytes = payload[offset:offset+4]
+            port_bytes = payload[offset+4:offset+6]
+            
+            ip = socket.inet_ntoa(ip_bytes)
+            port = struct.unpack('>H', port_bytes)[0]
+            
+            self.peers.append((ip, port))
+            offset += 6

@@ -4,6 +4,75 @@ import time
 import os
 import logging
 
+def bdecode(data):
+    """
+    Decode bencoded data
+    """
+    def decode_next(data, index=0):
+        if index >= len(data):
+            return None, index
+
+        if data[index] == ord('i'):  # integer
+            end_index = data.index(ord('e'), index)
+            number = int(data[index+1:end_index])
+            return number, end_index + 1
+
+        elif data[index] == ord('l'):  # list
+            index += 1
+            result = []
+            while data[index] != ord('e'):
+                item, index = decode_next(data, index)
+                result.append(item)
+            return result, index + 1
+
+        elif data[index] == ord('d'):  # dictionary
+            index += 1
+            result = {}
+            while data[index] != ord('e'):
+                key, index = decode_next(data, index)
+                value, index = decode_next(data, index)
+                result[key] = value
+            return result, index + 1
+
+        elif data[index] in b'0123456789':  # string
+            colon_index = data.index(ord(':'), index)
+            length = int(data[index:colon_index])
+            start = colon_index + 1
+            end = start + length
+            string_data = data[start:end]
+            return string_data, end
+
+        else:
+            raise ValueError(f"Invalid bencode format at position {index}")
+
+    result, _ = decode_next(data)
+    return result
+
+def bencode(data):
+    """
+    Encode data to bencode format
+    """
+    if isinstance(data, int):
+        return f"i{data}e".encode()
+    elif isinstance(data, bytes):
+        return f"{len(data)}:".encode() + data
+    elif isinstance(data, str):
+        return bencode(data.encode())
+    elif isinstance(data, list):
+        encoded = b"l"
+        for item in data:
+            encoded += bencode(item)
+        encoded += b"e"
+        return encoded
+    elif isinstance(data, dict):
+        encoded = b"d"
+        for key in sorted(data.keys()):
+            encoded += bencode(key)
+            encoded += bencode(data[key])
+        encoded += b"e"
+        return encoded
+    else:
+        raise ValueError(f"Unsupported data type: {type(data)}")
 
 class Torrent:
     def __init__(self):
@@ -21,10 +90,20 @@ class Torrent:
     def load_from_path(self, path):
         try:
             with open(path, 'rb') as f:
-                import bcoding
-                self.torrent_file = bcoding.bdecode(f)
+                # Now use the module-level bdecode function
+                self.torrent_file = bdecode(f.read())
         except Exception as e:
             logging.error(f"Failed to parse torrent file: {e}")
+            return None
+
+        # Check if this is a valid torrent file
+        if not self.torrent_file:
+            logging.error("Torrent file is empty or invalid")
+            return None
+            
+        if b'info' not in self.torrent_file:
+            logging.error("Torrent file missing 'info' dictionary")
+            logging.error(f"Available keys: {list(self.torrent_file.keys())}")
             return None
 
         # Extract basic info
@@ -33,9 +112,8 @@ class Torrent:
         self.pieces = info[b'pieces']
         self.name = info[b'name'].decode('utf-8')
         
-        # Calculate info hash
-        import bcoding
-        encoded_info = bcoding.bencode(info)
+        # Calculate info hash - use the module-level bencode function
+        encoded_info = bencode(info)
         self.info_hash = hashlib.sha1(encoded_info).digest()
         
         # Generate peer ID

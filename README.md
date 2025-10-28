@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Python BitTorrent Client
 
 A complete BitTorrent client implementation in Python from scratch. Features full protocol support including torrent parsing, tracker communication, peer-to-peer networking, and file downloading.
@@ -132,4 +131,4 @@ Disclaimer: Use responsibly and only download content you have rights to.
 =======
 # python-bittorrent-implementation-
 Python BitTorrent Client - Complete protocol implementation from scratch. Features torrent parsing, HTTP/UDP trackers, peer connections, piece management, and file downloading. Educational project for learning P2P networking.
->>>>>>> bebf37f81659e5a01b137b9afe97f06ad67e770d
+

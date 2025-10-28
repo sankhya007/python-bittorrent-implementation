@@ -121,6 +121,12 @@ class PeersManager(Thread):
         if self._do_handshake(peer_obj):
             self.peers.append(peer_obj)
             logging.info(f"Added peer {peer_obj.ip}:{peer_obj.port}")
+            
+            # Send "Interested" message immediately after handshake
+            interested_msg = message.Interested().to_bytes()
+            peer_obj.send_to_peer(interested_msg)
+            logging.info(f"Sent 'Interested' to {peer_obj.ip}")
+            
             return True
         return False
 

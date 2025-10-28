@@ -25,12 +25,19 @@ class BitTorrentClient:
         self.last_log_line = ""
 
     def initialize(self):
-        """Initialize all components"""
+        """Initialize all components with debug info"""
+        print(f"🚀 Initializing client with: {self.torrent_path}")
+        
         # Load torrent file
         self.torrent = Torrent().load_from_path(self.torrent_path)
         if not self.torrent:
             logging.error("Failed to load torrent file")
             return False
+
+        print(f"✅ Torrent loaded: {self.torrent.name}")
+        print(f"📊 Total size: {self.torrent.total_length} bytes")
+        print(f"🧩 Pieces: {self.torrent.number_of_pieces}")
+        print(f"🌐 Trackers: {len(self.torrent.announce_list)}")
 
         # Initialize managers
         self.pieces_manager = PiecesManager(self.torrent)
@@ -38,6 +45,7 @@ class BitTorrentClient:
         self.rarest_pieces = RarestPieces(self.pieces_manager)
         self.tracker = Tracker(self.torrent)
 
+        print("✅ All components initialized")
         return True
 
     def start(self):
@@ -69,45 +77,35 @@ class BitTorrentClient:
         return True
 
     def _download_loop(self):
-        """Main download loop"""
-        last_peer_check = time.time()
+        """Main download loop with better peer management"""
+        last_retry_time = time.time()
         
         while not self.pieces_manager.all_pieces_completed():
-            # Check if we have active peers
-            if not self.peers_manager.has_unchoked_peers():
-                if time.time() - last_peer_check > 10:
-                    logging.warning("No unchoked peers available")
-                    last_peer_check = time.time()
-                time.sleep(1)
-                continue
-
-            # Request blocks for pieces
-            self._request_blocks()
+            current_time = time.time()
             
-            # Update progress display
+            # Retry sending "Interested" every 30 seconds
+            if current_time - last_retry_time > 30:
+                for peer in self.peers_manager.peers:
+                    if peer.healthy and peer.is_choking():
+                        interested_msg = message.Interested().to_bytes()
+                        peer.send_to_peer(interested_msg)
+                        logging.info(f"Retried 'Interested' to {peer.ip}")
+                last_retry_time = current_time
+            
+            # Continue with normal download logic
+            self._request_blocks()
             self._display_progression()
             
-            time.sleep(0.1)
-
-        # Download completed
-        logging.info("Download completed successfully!")
-        self._display_progression()
-        self._cleanup()
+            time.sleep(1)  # Reduced sleep for more responsive checking
 
     def _request_blocks(self):
-        """Request blocks from peers for needed pieces"""
-        # Try rarest pieces first
-        rarest_piece_index = self.rarest_pieces.get_rarest_piece()
-        if rarest_piece_index is not None:
-            self._request_piece_blocks(rarest_piece_index)
-
-        # Also try other pieces that aren't complete
-        for piece_index in range(self.pieces_manager.number_of_pieces):
-            if self.pieces_manager.pieces[piece_index].is_full:
-                continue
-                
-            if piece_index != rarest_piece_index:
-                self._request_piece_blocks(piece_index)
+        """Request blocks from peers"""
+        for peer in self.peers_manager.peers:
+            if peer.healthy and peer.is_unchoked() and peer.am_interested():
+                # This peer is ready to send us data
+                piece_index = self.rarest_pieces.get_rarest_piece()
+                if piece_index is not None and peer.has_piece(piece_index):
+                    self._request_piece_blocks(piece_index, peer)
 
     def _request_piece_blocks(self, piece_index):
         """Request blocks for a specific piece"""

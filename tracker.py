@@ -1,9 +1,11 @@
-import socket
+import ipaddress
 import struct
+import peer
+import socket
 import requests
 import logging
 from urllib.parse import urlparse
-import ipaddress
+from torrent import bdecode
 
 import peer
 from message import UdpTrackerConnection, UdpTrackerAnnounce, UdpTrackerAnnounceOutput
@@ -16,10 +18,17 @@ class SockAddr:
         self.allowed = allowed
 
     def __hash__(self):
-        return f"{self.ip}:{self.port}"
+        # Return an integer hash based on ip and port
+        return hash((self.ip, self.port))
 
     def __str__(self):
         return f"{self.ip}:{self.port}"
+
+    def __eq__(self, other):
+        # Also implement __eq__ for proper dictionary usage
+        if not isinstance(other, SockAddr):
+            return False
+        return self.ip == other.ip and self.port == other.port
 
 
 class Tracker:
@@ -69,39 +78,63 @@ class Tracker:
                 logging.info(f"Connected to {len(self.connected_peers)}/{max_peers} peers: {new_peer.ip}")
 
     def http_scraper(self, tracker_url):
-        """Scrape HTTP tracker"""
+        """Fixed HTTP tracker with better error handling"""
         params = {
             'info_hash': self.torrent.info_hash,
             'peer_id': self.torrent.peer_id,
-            'uploaded': 0,
-            'downloaded': 0, 
             'port': 6881,
+            'uploaded': 0,
+            'downloaded': 0,
             'left': self.torrent.total_length,
-            'event': 'started',
-            'compact': 1
+            'compact': 1,
+            'numwant': 50,
+            'event': 'started'
         }
 
         try:
-            response = requests.get(tracker_url, params=params, timeout=10)
-            response_data = response.content
+            headers = {
+                'User-Agent': 'PythonBitTorrent/1.0',
+                'Accept': '*/*'
+            }
             
-            import bcoding
-            decoded_data = bcoding.bdecode(response_data)
+            response = requests.get(tracker_url, params=params, headers=headers, timeout=10)
             
-            if b'peers' in decoded_data:
-                peers_data = decoded_data[b'peers']
+            if response.status_code != 200:
+                print(f"  HTTP: Tracker returned status {response.status_code}")
+                return
+                
+            try:
+                response_data = bdecode(response.content)
+            except Exception as e:
+                print(f"  HTTP: Failed to decode response: {e}")
+                # Try to parse as text for debugging
+                print(f"  HTTP: Response preview: {response.content[:100]}")
+                return
+
+            if b'failure reason' in response_data:
+                reason = response_data[b'failure reason'].decode('utf-8', errors='ignore')
+                print(f"  HTTP: Tracker error: {reason}")
+                return
+                
+            if b'peers' in response_data:
+                peers_data = response_data[b'peers']
+                peer_count = 0
                 
                 if isinstance(peers_data, bytes):
                     # Compact format
-                    self._parse_compact_peers(peers_data)
+                    peer_count = self._parse_compact_peers(peers_data)
                 elif isinstance(peers_data, list):
                     # Dictionary format
-                    self._parse_dict_peers(peers_data)
+                    peer_count = self._parse_dict_peers(peers_data)
                     
-            logging.info(f"HTTP tracker {tracker_url} returned {len(self.dict_sock_addr)} peers")
-            
+                print(f"  HTTP: Found {peer_count} peers")
+                
+        except requests.exceptions.Timeout:
+            print(f"  HTTP: Timeout contacting {tracker_url}")
+        except requests.exceptions.ConnectionError:
+            print(f"  HTTP: Connection error to {tracker_url}")
         except Exception as e:
-            logging.error(f"HTTP tracker {tracker_url} failed: {e}")
+            print(f"  HTTP: Unexpected error: {e}")
 
     def _parse_compact_peers(self, peers_data):
         """Parse compact peer format (6 bytes per peer)"""
@@ -128,54 +161,76 @@ class Tracker:
             self.dict_sock_addr[hash(sock_addr)] = sock_addr
 
     def udp_scraper(self, announce_url):
-        """Scrape UDP tracker"""
-        parsed = urlparse(announce_url)
+        """Fixed UDP tracker implementation"""
+        import socket
+        from urllib.parse import urlparse
         
-        # Resolve hostname
         try:
-            ip = socket.gethostbyname(parsed.hostname)
+            parsed = urlparse(announce_url)
+            hostname = parsed.hostname
             port = parsed.port or 80
-        except Exception as e:
-            logging.error(f"Could not resolve UDP tracker hostname: {e}")
-            return
-
-        # Skip private IPs
-        if ipaddress.ip_address(ip).is_private:
-            return
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(8)
-
-        try:
+            
+            # Resolve hostname
+            ip = socket.gethostbyname(hostname)
+            print(f"  UDP: Resolved {hostname} -> {ip}:{port}")
+            
+            # Create socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(8)
+            
             # Connect phase
             connect_msg = UdpTrackerConnection()
-            response = self._send_udp_message((ip, port), sock, connect_msg)
-            if not response:
+            sock.sendto(connect_msg.to_bytes(), (ip, port))
+            
+            try:
+                response = sock.recv(4096)
+            except socket.timeout:
+                print(f"  UDP: Timeout connecting to {hostname}")
                 return
-
+            
+            if len(response) < 16:
+                print(f"  UDP: Invalid connect response from {hostname}")
+                return
+                
+            # Parse connect response
             connect_output = UdpTrackerConnection()
             connect_output.from_bytes(response)
-
-            # Announce phase  
-            announce_msg = UdpTrackerAnnounce(self.torrent.info_hash, connect_output.conn_id, self.torrent.peer_id)
-            response = self._send_udp_message((ip, port), sock, announce_msg)
-            if not response:
+            
+            # Announce phase
+            announce_msg = UdpTrackerAnnounce(
+                connection_id=connect_output.connection_id,
+                info_hash=self.torrent.info_hash,
+                peer_id=self.torrent.peer_id,
+                left=self.torrent.total_length
+            )
+            
+            sock.sendto(announce_msg.to_bytes(), (ip, port))
+            
+            try:
+                response = sock.recv(4096)
+            except socket.timeout:
+                print(f"  UDP: Timeout announcing to {hostname}")
                 return
-
+                
+            # Parse announce response
             announce_output = UdpTrackerAnnounceOutput()
             announce_output.from_bytes(response)
-
+            
             # Add discovered peers
-            for peer_ip, peer_port in announce_output.list_sock_addr:
+            for peer_ip, peer_port in announce_output.peers:
                 sock_addr = SockAddr(peer_ip, peer_port)
-                self.dict_sock_addr[hash(sock_addr)] = sock_addr
-
-            logging.info(f"UDP tracker returned {len(announce_output.list_sock_addr)} peers")
-
+                if hash(sock_addr) not in self.dict_sock_addr:
+                    self.dict_sock_addr[hash(sock_addr)] = sock_addr
+            
+            print(f"  UDP: {hostname} returned {len(announce_output.peers)} peers")
+            
+        except socket.gaierror as e:
+            print(f"  UDP: Could not resolve {hostname}: {e}")
         except Exception as e:
-            logging.error(f"UDP tracker error: {e}")
+            print(f"  UDP: Error with {announce_url}: {e}")
         finally:
-            sock.close()
+            if 'sock' in locals():
+                sock.close()
 
     def _send_udp_message(self, address, sock, message):
         """Send UDP message and wait for response"""
