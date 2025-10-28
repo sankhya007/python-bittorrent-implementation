@@ -89,8 +89,6 @@ python enhance_torrents.py
 3. Start downloading:
 python main.py ubuntu-22.04.torrent
 
-4. Monitor progress:
-📥  15.25% | ⏱️  45m 30s | 🚀  1250.5 KB/s | 🧩   152/1200 | 🔗   8 peers
 
 📖 Usage Examples
 =================
