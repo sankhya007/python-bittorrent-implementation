@@ -201,3 +201,10 @@ class Peer:
                     yield received_message
             except message.WrongMessageException as e:
                 logging.error(f"Wrong message from {self.ip}: {e}")
+    
+    def is_ready_for_requests(self):
+        """Check if peer is ready to receive piece requests"""
+        return (self.healthy and 
+                self.has_handshaked and 
+                self.is_unchoked() and 
+                self.am_interested())

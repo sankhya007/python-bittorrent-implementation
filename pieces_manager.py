@@ -7,6 +7,27 @@ import message
 
 class PiecesManager:
     
+    def unchoked_peers_count(self):
+        """Count number of unchoked peers"""
+        count = 0
+        for peer in self.peers:
+            if peer.is_unchoked() and peer.healthy:
+                count += 1
+        return count
+    
+    def log_peer_states(self):
+        """Log current state of all peers for debugging"""
+        for peer in self.peers:
+            if peer.healthy:
+                states = []
+                if peer.has_handshaked: states.append("handshaked")
+                if peer.is_choking(): states.append("choking")
+                if peer.is_unchoked(): states.append("unchoked") 
+                if peer.am_interested(): states.append("interested")
+                if peer.is_interested(): states.append("peer-interested")
+                
+                logging.info(f"Peer {peer.ip}: {', '.join(states)}")
+    
     def _process_new_message(self, new_message, peer_obj):
         """Process incoming message from peer with debug info"""
         message_type = type(new_message).__name__
